@@ -61,6 +61,7 @@ import (
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 	"github.com/rclone/rclone/lib/transferaccounter"
@@ -506,6 +507,38 @@ in particular an incorrect size, so it isn't recommended for normal
 operation. In practice the chance of an undetected upload failure is
 very small even with this flag.
 `,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "head_lag",
+			Help: `How long HEAD may show the state from before a change.
+
+After an upload, a copy or a rename, rclone repeats the HEAD of the new
+object until it shows the object with the expected size, for up to this
+long. Only after that does it report an error.`,
+			Default:  fs.Duration(0),
+			Advanced: true,
+		}, {
+			Name: "use_rename_object",
+			Help: `If set, move an object with RenameObject instead of copy and delete.
+
+The server must support the RenameObject call. The rename source follows
+copy_source_no_bucket.`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "real_directories",
+			Help: `If set, the server has real directories.
+
+Mkdir creates a directory by writing and deleting a temporary object
+in it, and Rmdir deletes the key of the directory with a trailing slash.`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "copy_source_no_bucket",
+			Help: `If set, send the copy source as the key only, without the bucket.
+
+Some gateways take x-amz-copy-source relative to the destination bucket.`,
 			Default:  false,
 			Advanced: true,
 		}, {
@@ -1119,6 +1152,10 @@ type Options struct {
 	NoCheckBucket               bool                 `config:"no_check_bucket"`
 	NoHead                      bool                 `config:"no_head"`
 	NoHeadObject                bool                 `config:"no_head_object"`
+	CopySourceNoBucket          bool                 `config:"copy_source_no_bucket"`
+	RealDirectories             bool                 `config:"real_directories"`
+	UseRenameObject             bool                 `config:"use_rename_object"`
+	HeadLag                     fs.Duration          `config:"head_lag"`
 	Enc                         encoder.MultiEncoder `config:"encoding"`
 	DisableHTTP2                bool                 `config:"disable_http2"`
 	DownloadURL                 string               `config:"download_url"`
@@ -1755,6 +1792,24 @@ func setQuirks(opt *Options, provider *Provider) {
 		opt.NoCheckBucket = true
 	}
 
+	for _, quirk := range []struct {
+		value *bool
+		opt   *bool
+	}{
+		{provider.Quirks.CopySourceNoBucket, &opt.CopySourceNoBucket},
+		{provider.Quirks.RealDirectories, &opt.RealDirectories},
+	} {
+		if quirk.value != nil && *quirk.value {
+			*quirk.opt = true
+		}
+	}
+
+	if opt.HeadLag == 0 && provider.Quirks.HeadLag != "" {
+		if lag, err := time.ParseDuration(provider.Quirks.HeadLag); err == nil {
+			opt.HeadLag = fs.Duration(lag)
+		}
+	}
+
 	// Set the correct list version if not manually set
 	if opt.ListVersion == 0 {
 		if provider.Quirks.ListVersion != nil {
@@ -1914,6 +1969,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.Provider == "Fastly" {
 		f.features.Copy = nil
+	}
+	if !opt.UseRenameObject {
+		f.features.Move = nil
 	}
 	if opt.Provider == "Rabata" {
 		f.features.Copy = nil
@@ -2879,6 +2937,9 @@ func (f *Fs) bucketExists(ctx context.Context, bucket string) (bool, error) {
 
 // Create directory marker file and parents
 func (f *Fs) createDirectoryMarker(ctx context.Context, bucket, dir string) error {
+	if f.opt.RealDirectories {
+		return f.createRealDirectory(ctx, bucket, dir)
+	}
 	if !f.opt.DirectoryMarkers || bucket == "" {
 		return nil
 	}
@@ -2923,6 +2984,27 @@ func (f *Fs) createDirectoryMarker(ctx context.Context, bucket, dir string) erro
 	return nil
 }
 
+// createRealDirectory makes the server create dir by writing and deleting an object in it
+func (f *Fs) createRealDirectory(ctx context.Context, bucket, dir string) error {
+	_, bucketPath := f.split(dir)
+	if bucket == "" || bucketPath == "" {
+		return nil
+	}
+	o := &Object{
+		fs:     f,
+		remote: dir + "/.rclone-mkdir-" + random.String(12),
+		meta:   map[string]string{metaMtime: swift.TimeToFloatString(time.Now())},
+	}
+	fs.Debugf(o, "Creating directory through a temporary object")
+	if err := o.Update(ctx, strings.NewReader(""), o); err != nil {
+		return fmt.Errorf("creating directory failed: %w", err)
+	}
+	if err := o.Remove(ctx); err != nil {
+		return fmt.Errorf("removing temporary object of mkdir failed: %w", err)
+	}
+	return nil
+}
+
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	bucket, _ := f.split(dir)
@@ -2939,6 +3021,11 @@ func (f *Fs) mkdirParent(ctx context.Context, remote string) error {
 	dir := path.Dir(remote)
 	if dir == "/" || dir == "." {
 		dir = ""
+	}
+	if f.opt.RealDirectories {
+		// The server creates the parents of an object
+		bucket, _ := f.split(dir)
+		return f.makeBucket(ctx, bucket)
 	}
 	return f.Mkdir(ctx, dir)
 }
@@ -2993,7 +3080,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	bucket, directory := f.split(dir)
 	// Remove directory marker file, including the one of the root
 	// when it is a directory in the bucket
-	if f.opt.DirectoryMarkers && bucket != "" && directory != "" {
+	if (f.opt.DirectoryMarkers || f.opt.RealDirectories) && bucket != "" && directory != "" {
 		o := &Object{
 			fs:     f,
 			remote: dir + "/",
@@ -3042,6 +3129,9 @@ func (f *Fs) copy(ctx context.Context, req *s3.CopyObjectInput, dstBucket, dstPa
 	req.ACL = types.ObjectCannedACL(f.opt.ACL)
 	req.Key = &dstPath
 	source := pathEscape(bucket.Join(srcBucket, srcPath))
+	if f.opt.CopySourceNoBucket {
+		source = pathEscape(srcPath)
+	}
 	if src.versionID != nil {
 		source += fmt.Sprintf("?versionId=%s", *src.versionID)
 	}
@@ -3234,6 +3324,90 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 	})
 }
 
+// headAfterChange does a HEAD of o after it was written.
+//
+// With head_lag it repeats the HEAD until the object shows with size
+// (if size >= 0) or the lag has passed.
+func (o *Object) headAfterChange(ctx context.Context, size int64) (head *s3.HeadObjectOutput, err error) {
+	deadline := time.Now().Add(time.Duration(o.fs.opt.HeadLag))
+	for pause := 20 * time.Millisecond; ; pause *= 2 {
+		head, err = o.headObject(ctx)
+		settled := err == nil && (size < 0 || deref(head.ContentLength) == size)
+		if settled || !time.Now().Add(pause).Before(deadline) {
+			return head, err
+		}
+		fs.Debugf(o, "HEAD does not show the change yet, repeating")
+		select {
+		case <-ctx.Done():
+			return head, ctx.Err()
+		case <-time.After(pause):
+		}
+	}
+}
+
+// movedObject returns the object at remote after a copy or a rename of srcObj.
+func (f *Fs) movedObject(ctx context.Context, srcObj *Object, remote string) (fs.Object, error) {
+	if f.opt.NoHeadObject || f.opt.HeadLag == 0 {
+		return f.NewObject(ctx, remote)
+	}
+	o := &Object{fs: f, remote: remote}
+	head, err := o.headAfterChange(ctx, srcObj.bytes)
+	if err != nil {
+		return nil, err
+	}
+	o.setMetaData(head)
+	return o, nil
+}
+
+// Move src to this remote with RenameObject.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok || !f.opt.UseRenameObject || f.opt.VersionAt.IsSet() {
+		return nil, fs.ErrorCantMove
+	}
+	dstBucket, dstPath := f.split(remote)
+	srcBucket, srcPath := srcObj.split()
+	if srcBucket != dstBucket {
+		return nil, fs.ErrorCantMove
+	}
+	if err := f.mkdirParent(ctx, remote); err != nil {
+		return nil, err
+	}
+	source := pathEscape(bucket.Join(srcBucket, srcPath))
+	if f.opt.CopySourceNoBucket {
+		source = pathEscape(srcPath)
+	}
+	req := s3.RenameObjectInput{
+		Bucket:       &dstBucket,
+		Key:          &dstPath,
+		RenameSource: &source,
+	}
+	err := f.pacer.Call(func() (bool, error) {
+		_, err := f.c.RenameObject(ctx, &req)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	dstObj, err := f.movedObject(ctx, srcObj, remote)
+	if err != nil {
+		return nil, err
+	}
+	if f.opt.NoHeadObject {
+		if dstObject, ok := dstObj.(*Object); ok {
+			dstObject.bytes = srcObj.bytes
+			dstObject.md5 = srcObj.md5
+		}
+	}
+	return dstObj, nil
+}
+
 // Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given.
@@ -3294,7 +3468,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	dstObj, err := f.NewObject(ctx, remote)
+	dstObj, err := f.movedObject(ctx, srcObj, remote)
 	if err != nil {
 		return nil, err
 	}
@@ -4557,6 +4731,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		} else {
 			fs.Debugf(o, "Failed to find length in %q", contentRange)
 		}
+	} else if req.Range != nil && o.bytes >= 0 {
+		// A ranged answer without Content-Range has the range length, not the object size
+		size = &o.bytes
 	}
 	var head s3.HeadObjectOutput
 	//structs.SetFrom(&head, resp)
@@ -5299,7 +5476,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	} else {
 		// Read the metadata from the newly created object
 		o.meta = nil // wipe old metadata
-		head, err = o.headObject(ctx)
+		head, err = o.headAfterChange(ctx, size)
 		if err != nil {
 			return err
 		}
@@ -5560,6 +5737,7 @@ var (
 	_ fs.Fs              = &Fs{}
 	_ fs.Purger          = &Fs{}
 	_ fs.Copier          = &Fs{}
+	_ fs.Mover           = &Fs{}
 	_ fs.PutStreamer     = &Fs{}
 	_ fs.ListRer         = &Fs{}
 	_ fs.ListPer         = &Fs{}

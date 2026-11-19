@@ -39,6 +39,9 @@ type Quirks struct {
 	CopyCutoff                  *int64 `yaml:"copy_cutoff,omitempty"`
 	MaxUploadParts              *int   `yaml:"max_upload_parts,omitempty"`
 	MinChunkSize                *int64 `yaml:"min_chunk_size,omitempty"`
+	HeadLag                     string `yaml:"head_lag,omitempty"`              // how long HEAD may show the old state, e.g. 2s
+	CopySourceNoBucket          *bool  `yaml:"copy_source_no_bucket,omitempty"` // true = copy source is the key only
+	RealDirectories             *bool  `yaml:"real_directories,omitempty"`      // true = the server has real directories
 }
 
 // Provider defines the configurable data in each provider.yaml

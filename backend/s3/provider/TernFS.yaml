@@ -1,0 +1,21 @@
+name: TernFS
+description: TernFS S3 gateway
+region: {}
+endpoint: {}
+location_constraint: {}
+acl: {}
+quirks:
+  list_version: 2
+  force_path_style: true
+  no_check_bucket: true
+  list_url_encode: false
+  use_multipart_etag: false
+  use_already_exists: false
+  # a HEAD right after a change can show the old state for up to about 0.6 s
+  head_lag: 3s
+  # x-amz-copy-source is taken relative to the destination bucket
+  copy_source_no_bucket: true
+  # 64 MiB parts: a streamed upload can reach 625 GiB instead of 48.8 GiB
+  min_chunk_size: 67108864
+  # directories are real: they outlive their last object
+  real_directories: true
