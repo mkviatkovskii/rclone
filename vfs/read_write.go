@@ -95,6 +95,12 @@ func (fh *RWFileHandle) openPending() (err error) {
 	}
 	defer log.Trace(fh.logPrefix(), "")("err=%v", &err)
 
+	d := fh.file.Dir()
+	done, err := d.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	fh.file.muRW.Lock()
 	defer fh.file.muRW.Unlock()
 
@@ -112,7 +118,7 @@ func (fh *RWFileHandle) openPending() (err error) {
 		fh.offset = 0
 	}
 	fh.opened = true
-	fh.d.addObject(fh.file) // make sure the directory has this object in it now
+	d.addObject(fh.file) // make sure the directory has this object in it now
 	return nil
 }
 

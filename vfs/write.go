@@ -73,6 +73,12 @@ func (fh *WriteFileHandle) openPending() (err error) {
 		fs.Errorf(fh.remote, "WriteFileHandle: Can't open for write without O_TRUNC on existing file without --vfs-cache-mode >= writes")
 		return EPERM
 	}
+	d := fh.file.Dir()
+	done, err := d.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	var pipeReader *io.PipeReader
 	pipeReader, fh.pipeWriter = io.Pipe()
 	go func() {
@@ -98,7 +104,7 @@ func (fh *WriteFileHandle) openPending() (err error) {
 	}()
 	fh.file.setSize(0)
 	fh.truncated = true
-	fh.file.Dir().addObject(fh.file) // make sure the directory has this object in it now
+	d.addObject(fh.file) // make sure the directory has this object in it now
 	fh.opened = true
 	return nil
 }
@@ -232,6 +238,13 @@ func (fh *WriteFileHandle) closeWithError(reason error) (err error) {
 	writeCloseErr := fh.pipeWriter.CloseWithError(reason)
 	err = <-fh.result
 	if err == nil {
+		fh.file.muRename.Lock()
+		defer fh.file.muRename.Unlock()
+		done, publishErr := fh.file.Dir().beginMutation()
+		if publishErr != nil {
+			return publishErr
+		}
+		defer done()
 		fh.file.setObject(fh.o)
 		err = writeCloseErr
 	} else {

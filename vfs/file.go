@@ -45,7 +45,8 @@ type File struct {
 	size  atomic.Int64    // size of file
 	ctx   context.Context // context for VFS operations - read only
 
-	muRW sync.Mutex // synchronize RWFileHandle.openPending(), RWFileHandle.close() and File.Remove
+	muRW     sync.Mutex // synchronize RWFileHandle.openPending(), RWFileHandle.close() and File.Remove
+	muRename sync.Mutex
 
 	mu               sync.RWMutex                    // protects the following
 	d                *Dir                            // parent directory
@@ -59,6 +60,9 @@ type File struct {
 	nwriters         atomic.Int32                    // len(writers)
 	appendMode       bool                            // file was opened with O_APPEND
 	isLink           bool                            // file represents a symlink
+	local            bool
+	generation       uint64
+	opening          int
 }
 
 // newFile creates a new File
@@ -196,9 +200,10 @@ func (f *File) Node() Node {
 
 // renameDir - call when parent directory has been renamed
 func (f *File) renameDir(dPath string) {
-	f.mu.RLock()
+	f.mu.Lock()
 	f.dPath = dPath
-	f.mu.RUnlock()
+	f.generation++
+	f.mu.Unlock()
 }
 
 // applyPendingRename runs a previously set rename operation if there are no
@@ -221,6 +226,8 @@ func (f *File) applyPendingRename() {
 // Otherwise it will queue the rename operation on the remote until no writers
 // remain.
 func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+	f.muRename.Lock()
+	defer f.muRename.Unlock()
 	f.mu.RLock()
 	d := f.d
 	oldPendingRenameFun := f.pendingRenameFun
@@ -297,6 +304,7 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 	f.d = destDir
 	f.dPath = dPath
 	f.leaf = newName
+	f.generation++
 	writing := f._writingInProgress()
 	f.mu.Unlock()
 
@@ -539,6 +547,8 @@ func (f *File) setSize(n int64) {
 func (f *File) setObject(o fs.Object) {
 	f.mu.Lock()
 	f.o = o
+	f.local = true
+	f.generation++
 	f._setIsLink()
 	_ = f._applyPendingModTime()
 	d := f.d
@@ -548,15 +558,32 @@ func (f *File) setObject(o fs.Object) {
 	d.addObject(f)
 }
 
-// Update the object but don't update the directory cache - for use by
-// the directory cache
-func (f *File) setObjectNoUpdate(o fs.Object) {
+func (f *File) refreshState() (generation uint64, local, busy bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.generation, f.local, f._refreshBusy()
+}
+
+func (f *File) _refreshBusy() bool {
+	return f.opening != 0 || len(f.writers) != 0 ||
+		(f.d.vfs.cache != nil && f.d.vfs.cache.InUse(f._cachePath()))
+}
+
+func (f *File) refreshObject(d *Dir, leaf string, o fs.Object, generation uint64, listed bool) bool {
 	f.mu.Lock()
-	f.o = o
-	f._setIsLink()
-	f.virtualModTime = nil
-	fs.Debugf(f._path(), "Reset virtual modtime")
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	if f.d != d || f.leaf != leaf || f.generation != generation || f._refreshBusy() {
+		return false
+	}
+	if o != nil {
+		f.o = o
+		f._setIsLink()
+		f.virtualModTime = nil
+	}
+	if listed {
+		f.local = false
+	}
+	return true
 }
 
 // Get the current fs.Object - may be nil
@@ -669,6 +696,11 @@ func (f *File) Remove() (err error) {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	done, err := d.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer done()
 
 	// Remove the object from the cache
 	wasWriting := false
@@ -887,6 +919,27 @@ func (f *File) Open(flags int) (fd Handle, err error) {
 	f.mu.RLock()
 	d := f.d
 	f.mu.RUnlock()
+	if write {
+		done, err := d.beginMutation()
+		if err != nil {
+			return nil, err
+		}
+		defer done()
+		d.mu.Lock()
+		f.mu.Lock()
+		f.opening++
+		f.generation++
+		if f.o == nil {
+			f.dPath = d.path
+		}
+		f.mu.Unlock()
+		d.mu.Unlock()
+		defer func() {
+			f.mu.Lock()
+			f.opening--
+			f.mu.Unlock()
+		}()
+	}
 	CacheMode := d.vfs.Opt.CacheMode
 	if CacheMode >= vfscommon.CacheModeMinimal && (d.vfs.cache.InUse(f.CachePath()) || d.vfs.cache.Exists(f.CachePath())) {
 		fd, err = f.openRW(flags)
