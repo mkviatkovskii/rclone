@@ -45,7 +45,8 @@ type File struct {
 	size  atomic.Int64    // size of file
 	ctx   context.Context // context for VFS operations - read only
 
-	muRW sync.Mutex // synchronize RWFileHandle.openPending(), RWFileHandle.close() and File.Remove
+	muRW     sync.Mutex // synchronize RWFileHandle.openPending(), RWFileHandle.close() and File.Remove
+	muRename sync.Mutex
 
 	mu               sync.RWMutex                    // protects the following
 	d                *Dir                            // parent directory
@@ -221,8 +222,23 @@ func (f *File) applyPendingRename() {
 // Otherwise it will queue the rename operation on the remote until no writers
 // remain.
 func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+	f.muRename.Lock()
+	defer f.muRename.Unlock()
 	f.mu.RLock()
 	d := f.d
+	f.mu.RUnlock()
+	if cache := d.VFS().cache; cache != nil {
+		return cache.Item(f.CachePath()).WithUploadLock(ctx, func() error {
+			return f.renameObject(ctx, destDir, newName)
+		})
+	}
+	return f.renameObject(ctx, destDir, newName)
+}
+
+func (f *File) renameObject(ctx context.Context, destDir *Dir, newName string) error {
+	f.mu.RLock()
+	d := f.d
+	oldDirPath, oldName := f.dPath, f.leaf
 	oldPendingRenameFun := f.pendingRenameFun
 	oldPath := f._cachePath()
 	newCacheName := f._fixCachePath(newName)
@@ -313,7 +329,13 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		return nil
 	}
 
-	return renameCall(ctx)
+	err := renameCall(ctx)
+	if err != nil {
+		f.mu.Lock()
+		f.d, f.dPath, f.leaf = d, oldDirPath, oldName
+		f.mu.Unlock()
+	}
+	return err
 }
 
 // addWriter adds a write handle to the file

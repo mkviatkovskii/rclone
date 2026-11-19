@@ -56,7 +56,8 @@ import (
 // The Info field is written to the backing store to store status
 type Item struct {
 	// read only
-	c               *Cache                   // cache this is part of
+	c               *Cache // cache this is part of
+	uploadLock      chan struct{}
 	mu              sync.Mutex               // protect the variables
 	cond            sync.Cond                // synchronize with cache cleaner
 	name            string                   // name in the VFS
@@ -135,8 +136,9 @@ type StoreFn func(fs.Object)
 func newItem(c *Cache, name string) (item *Item) {
 	now := time.Now()
 	item = &Item{
-		c:    c,
-		name: name,
+		c:          c,
+		uploadLock: make(chan struct{}, 1),
+		name:       name,
 		info: Info{
 			ModTime: now,
 			ATime:   now,
@@ -640,6 +642,28 @@ func unlockMutexForCall(mu *sync.Mutex, f func()) {
 //
 // Call with lock held
 func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
+	unlockMutexForCall(&item.mu, func() {
+		err = item.WithUploadLock(ctx, func() error {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return item._storeLocked(ctx, storeFn)
+		})
+	})
+	return err
+}
+
+// WithUploadLock serializes fn with upload completion without blocking cancellation.
+func (item *Item) WithUploadLock(ctx context.Context, fn func() error) error {
+	select {
+	case item.uploadLock <- struct{}{}:
+		defer func() { <-item.uploadLock }()
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (item *Item) _storeLocked(ctx context.Context, storeFn StoreFn) (err error) {
 	// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
 
 	// Transfer the temp file to the remote
@@ -1570,6 +1594,7 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 
 	// id for writeback cancel
 	id := item.writeBackID
+	dirty := item.info.Dirty
 
 	// Set internal state
 	item.name = newName
@@ -1591,6 +1616,8 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	if downloaders != nil {
 		_ = downloaders.Close(nil)
 	}
-	item.c.writeback.Rename(id, newName)
+	if dirty {
+		item.c.writeback.Rename(id, newName)
+	}
 	return err
 }
