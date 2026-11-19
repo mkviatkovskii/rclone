@@ -178,19 +178,24 @@ var (
 
 // VFS represents the top level filing system
 type VFS struct {
-	f           fs.Fs
-	ctx         context.Context
-	root        *Dir
-	Opt         vfscommon.Options
-	cache       *vfscache.Cache
-	cancel      context.CancelFunc
-	cancelCache context.CancelFunc
-	usageMu     sync.Mutex
-	usageTime   time.Time
-	usage       *fs.Usage
-	pollMu      sync.Mutex
-	pollChan    chan time.Duration
-	inUse       atomic.Int32 // count of number of opens
+	f            fs.Fs
+	ctx          context.Context
+	root         *Dir
+	Opt          vfscommon.Options
+	cache        *vfscache.Cache
+	cancel       context.CancelFunc
+	cancelCache  context.CancelFunc
+	usageMu      sync.Mutex
+	usageTime    time.Time
+	usage        *fs.Usage
+	pollMu       sync.Mutex
+	pollChan     chan time.Duration
+	inUse        atomic.Int32 // count of number of opens
+	dirMu        sync.Mutex
+	dirMoveMu    sync.Mutex
+	dirs         map[uint64]map[string]*dirBinding
+	dirChanged   chan struct{}
+	dirSweepDone chan struct{}
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -213,9 +218,12 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 	newCtx = filter.CopyConfig(newCtx, ctx)
 	ctx, cancel := context.WithCancel(newCtx)
 	vfs := &VFS{
-		f:      f,
-		ctx:    ctx,
-		cancel: cancel,
+		f:            f,
+		ctx:          ctx,
+		cancel:       cancel,
+		dirs:         make(map[uint64]map[string]*dirBinding),
+		dirChanged:   make(chan struct{}),
+		dirSweepDone: make(chan struct{}),
 	}
 	vfs.inUse.Store(1)
 
@@ -247,6 +255,7 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 
 	// Create root directory
 	vfs.root = newDir(vfs, f, nil, fsDir)
+	go vfs.maintainDirs()
 
 	// Start polling function
 	features := vfs.f.Features()
@@ -435,6 +444,7 @@ func (vfs *VFS) Shutdown() {
 
 	// Cancel any background go routines
 	vfs.cancel()
+	<-vfs.dirSweepDone
 
 	vfs.pollMu.Lock()
 	if vfs.pollChan != nil {
@@ -948,6 +958,11 @@ func (vfs *VFS) AddVirtual(remote string, size int64, isDir bool) (err error) {
 	if err != nil {
 		return err
 	}
+	done, err := dir.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer done()
 	dir.AddVirtual(leaf, size, isDir)
 	return nil
 }

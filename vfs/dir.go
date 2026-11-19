@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/dirtree"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/object"
@@ -31,18 +33,23 @@ type Dir struct {
 	f            fs.Fs       // read only
 	cleanupTimer *time.Timer // read only: timer to call cacheCleanup
 
-	mu      sync.RWMutex // protects the following
-	parent  *Dir         // parent, nil for root
-	path    string
-	entry   fs.Directory
-	read    time.Time         // time directory entry last read
-	items   map[string]Node   // directory entries - can be empty but not nil
-	virtual map[string]vState // virtual directory entries - may be nil
+	mu         sync.RWMutex // protects the following
+	parent     *Dir         // parent, nil for root
+	path       string
+	entry      fs.Directory
+	read       time.Time         // time directory entry last read
+	items      map[string]Node   // directory entries - can be empty but not nil
+	virtual    map[string]vState // virtual directory entries - may be nil
+	generation uint64
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
 
 	_virtuals atomic.Int32 // number of virtual directory entries in this directory and children
+	retired   atomic.Bool
+	key       dirKey
+	pending   int
+	removing  bool
 }
 
 //go:generate stringer -type=vState
@@ -68,11 +75,7 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 		inode:   newInode(),
 		items:   make(map[string]Node),
 	}
-	// Set timer up like this to avoid race of d.cacheCleanup being called
-	// before d.cleanupTimer is assigned to
-	d.cleanupTimer = time.AfterFunc(time.Hour, d.cacheCleanup)
-	d.cleanupTimer.Reset(time.Duration(vfs.Opt.DirCacheTime * 2))
-	return d
+	return vfs.bindDir(d)
 }
 
 func (d *Dir) cacheCleanup() {
@@ -197,14 +200,6 @@ func (d *Dir) hasVirtual() bool {
 	return d._virtuals.Load() != 0
 }
 
-// addVirtual adds n virtual items to this directory and all of its parents
-func (d *Dir) addVirtual(n int32) {
-	for d != nil {
-		d._virtuals.Add(n)
-		d = d.parent
-	}
-}
-
 // ForgetAll forgets directory entries for this directory and any children.
 //
 // It does not invalidate or clear the cache of the parent directory.
@@ -218,10 +213,8 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	d.mu.RLock()
 
 	fs.Debugf(d.path, "forgetting directory cache")
-	for _, node := range d.items {
-		if dir, ok := node.(*Dir); ok {
-			dir.ForgetAll()
-		}
+	for _, dir := range d.vfs.liveChildren(d) {
+		dir.ForgetAll()
 	}
 
 	d.mu.RUnlock()
@@ -230,6 +223,16 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.vfs.ctx.Err() != nil {
+		d.cleanupTimer.Stop()
+		return d.hasVirtual()
+	}
+	if d.retired.Load() {
+		d.items = make(map[string]Node)
+		d.virtual = nil
+		d.cleanupTimer.Stop()
+		return false
+	}
 
 	// Purge any unnecessary virtual entries
 	d._purgeVirtual()
@@ -242,7 +245,7 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 		d.items = make(map[string]Node)
 		d.cleanupTimer.Stop()
 	} else {
-		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+		d.resetCleanup()
 	}
 
 	return hasVirtual
@@ -315,10 +318,19 @@ func (d *Dir) ForgetPath(relativePath string, entryType fs.EntryType) {
 func (d *Dir) walk(fun func(*Dir)) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, node := range d.items {
+	children := make(map[string]*Dir)
+	for leaf, node := range d.items {
 		if dir, ok := node.(*Dir); ok {
-			dir.walk(fun)
+			children[leaf] = dir
 		}
+	}
+	for leaf, dir := range d.vfs.liveChildren(d) {
+		if dir.hasVirtual() {
+			children[leaf] = dir
+		}
+	}
+	for _, dir := range children {
+		dir.walk(fun)
 	}
 
 	fun(d)
@@ -361,23 +373,39 @@ func (d *Dir) _age(when time.Time) (age time.Duration, stale bool) {
 //
 // path should be the desired path
 func (d *Dir) renameTree(dirPath string) {
+	d.vfs.dirMu.Lock()
+	parent := d.parent
+	d.vfs.dirMu.Unlock()
+	if parent != nil {
+		parent.mu.Lock()
+		defer parent.mu.Unlock()
+	}
+	d.renameChildren(dirPath)
+}
+
+func (d *Dir) renameChildren(dirPath string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	// Make sure the path is correct for each node
 	if d.path != dirPath {
 		fs.Debugf(d.path, "Renaming to %q", dirPath)
-		delete(d.parent.items, name(d.path))
+		if d.parent.items[name(d.path)] == d {
+			delete(d.parent.items, name(d.path))
+			d.parent.items[name(dirPath)] = d
+		}
+		d.rebindParent(d.parent, name(dirPath))
 		d.path = dirPath
-		d.parent.items[name(d.path)] = d
+		d.generation++
 		d.entry = fs.NewDirCopy(d.vfs.ctx, d.entry).SetRemote(dirPath)
 	}
 
-	// Do the same to any child directories and files
-	for leaf, node := range d.items {
+	for leaf, child := range d.vfs.liveChildren(d) {
+		child.renameChildren(path.Join(dirPath, leaf))
+	}
+	for _, node := range d.items {
 		switch x := node.(type) {
 		case *Dir:
-			x.renameTree(path.Join(dirPath, leaf))
 		case *File:
 			x.renameDir(dirPath)
 		default:
@@ -401,15 +429,16 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.modTimeMu.Unlock()
 	d.mu.Lock()
 	oldPath := d.path
-	d.parent = newParent
+	d.rebindParent(newParent, name(fsDir.Remote()))
 	d.entry = fsDir
 	d.path = fsDir.Remote()
+	d.generation++
 	newPath := d.path
 	d.read = time.Time{}
 	d.mu.Unlock()
 
 	// Rename any remaining items in the tree that we couldn't forget
-	d.renameTree(d.path)
+	d.renameChildren(newPath)
 
 	// Rename in the cache
 	if d.vfs.cache != nil && d.vfs.cache.DirExists(oldPath) {
@@ -436,6 +465,10 @@ func name(p string) string {
 // note that we add new objects rather than updating old ones
 func (d *Dir) addObject(node Node) {
 	d.mu.Lock()
+	if d.retired.Load() {
+		d.mu.Unlock()
+		return
+	}
 	leaf := node.Name()
 	d.items[leaf] = node
 	if d.virtual == nil {
@@ -525,6 +558,12 @@ func (d *Dir) DelVirtual(leaf string) {
 
 // read the directory and sets d.items - must be called with the lock held
 func (d *Dir) _readDir() error {
+	if err := d.vfs.ctx.Err(); err != nil {
+		return err
+	}
+	if d.retired.Load() {
+		return ENOENT
+	}
 	when := time.Now()
 	if age, stale := d._age(when); stale {
 		if age != 0 {
@@ -576,7 +615,7 @@ func (d *Dir) _readDir() error {
 	}
 
 	d.read = time.Now()
-	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+	d.resetCleanup()
 
 	return nil
 }
@@ -695,6 +734,7 @@ func (mv manageVirtuals) add(d *Dir, name string) bool {
 //
 // must be called with the Dir lock held
 func (mv manageVirtuals) end(d *Dir) {
+	d.reconcileChildren(mv)
 	// delete unused d.items
 	for name := range d.items {
 		if _, ok := mv[name]; !ok {
@@ -725,7 +765,47 @@ func (mv manageVirtuals) end(d *Dir) {
 // update d.items and if dirTree is not nil update each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
 func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time) error {
+	if err := d.vfs.ctx.Err(); err != nil {
+		return err
+	}
+	if d.retired.Load() {
+		return ENOENT
+	}
 	var err error
+	for leaf, child := range d.vfs.liveChildren(d) {
+		if child.hasVirtual() {
+			d.items[leaf] = child
+		}
+	}
+	type pointResult struct {
+		file       *File
+		object     fs.Object
+		generation uint64
+	}
+	listed := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		leaf := path.Base(entry.Remote())
+		if d.vfs.Opt.Links {
+			leaf = strings.TrimSuffix(leaf, fs.LinkSuffix)
+		}
+		listed[leaf] = true
+	}
+	points := make(map[string]pointResult)
+	for leaf, node := range d.items {
+		file, ok := node.(*File)
+		if !ok || listed[leaf] {
+			continue
+		}
+		generation, local, busy := file.refreshState()
+		if !local || busy {
+			continue
+		}
+		obj, err := d._lookupObject(leaf)
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+			return err
+		}
+		points[leaf] = pointResult{file, obj, generation}
+	}
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
 		name := path.Base(entry.Remote())
@@ -738,15 +818,35 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			continue
 		}
 		node := d.items[name]
+		if file, ok := node.(*File); ok {
+			_, _, busy := file.refreshState()
+			if busy {
+				mv[name] = struct{}{}
+				continue
+			}
+		}
 		if mv.add(d, name) {
 			continue
 		}
 		switch item := entry.(type) {
 		case fs.Object:
 			obj := item
+			d.vfs.dirMu.Lock()
+			if binding := d.vfs.dirs[d.inode][name]; binding != nil {
+				if dir := binding.dir.Value(); dir != nil {
+					if dir.hasVirtual() || dir.pending != 0 || dir.removing {
+						d.items[name] = dir
+						d.vfs.dirMu.Unlock()
+						continue
+					}
+					d.vfs.retireDir(dir)
+				}
+			}
+			d.vfs.dirMu.Unlock()
 			// Reuse old file value if it exists
 			if file, ok := node.(*File); node != nil && ok {
-				file.setObjectNoUpdate(obj)
+				generation, _, _ := file.refreshState()
+				file.refreshObject(d, name, obj, generation, true)
 			} else {
 				node = newFile(d, d.path, obj, name)
 			}
@@ -757,7 +857,9 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			}
 			dir := node.(*Dir)
 			dir.mu.Lock()
+			dir.modTimeMu.Lock()
 			dir.modTime = item.ModTime(d.vfs.ctx)
+			dir.modTimeMu.Unlock()
 			dir.entry = item
 			if dirTree != nil {
 				err = dir._readDirFromDirTree(dirTree, when)
@@ -765,7 +867,7 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 					dir.read = time.Time{}
 				} else {
 					dir.read = when
-					dir.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+					dir.resetCleanup()
 				}
 			}
 			dir.mu.Unlock()
@@ -779,14 +881,54 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 		}
 		d.items[name] = node
 	}
+	for leaf, result := range points {
+		if !result.file.refreshObject(d, leaf, result.object, result.generation, false) ||
+			result.object != nil {
+			mv[leaf] = struct{}{}
+		}
+	}
 	mv.end(d)
 	return nil
+}
+
+func (d *Dir) _lookupObject(leaf string) (fs.Object, error) {
+	if sanitize.Leaf(leaf) != nil || d.virtual[leaf] == vDel {
+		return nil, fs.ErrorObjectNotFound
+	}
+	fi := filter.GetConfig(d.vfs.ctx)
+	excluded, err := fi.DirContainsExcludeFile(d.vfs.ctx, d.f, d.path)
+	if err != nil {
+		return nil, err
+	}
+	if excluded {
+		return nil, fs.ErrorObjectNotFound
+	}
+	remote := path.Join(d.path, leaf)
+	o, err := d.f.NewObject(d.vfs.ctx, remote)
+	if err == nil && d.vfs.Opt.Links && strings.HasSuffix(o.Remote(), fs.LinkSuffix) {
+		err = fs.ErrorObjectNotFound
+	}
+	if errors.Is(err, fs.ErrorObjectNotFound) && d.vfs.Opt.Links {
+		o, err = d.f.NewObject(d.vfs.ctx, remote+fs.LinkSuffix)
+	}
+	if errors.Is(err, fs.ErrorIsDir) || errors.Is(err, fs.ErrorNotAFile) {
+		return nil, fs.ErrorObjectNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !o.Storable() || list.RemoteEscapesRoot(o.Remote()) ||
+		path.Dir(o.Remote()) != path.Dir(remote) || !fi.IncludeObject(d.vfs.ctx, o) {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return o, nil
 }
 
 // readDirTree forces a refresh of the complete directory tree
 func (d *Dir) readDirTree() error {
 	d.mu.RLock()
 	f, path := d.f, d.path
+	generation := d.generation
 	d.mu.RUnlock()
 	when := time.Now()
 	fs.Debugf(path, "Reading directory tree")
@@ -797,13 +939,16 @@ func (d *Dir) readDirTree() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.read = time.Time{}
+	if d.generation != generation {
+		return d._readDir()
+	}
 	err = d._readDirFromDirTree(dt, when)
 	if err != nil {
 		return err
 	}
 	fs.Debugf(d.path, "Reading directory tree done in %s", time.Since(when))
 	d.read = when
-	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+	d.resetCleanup()
 	return nil
 }
 
@@ -910,7 +1055,25 @@ func (d *Dir) stat(leaf string) (Node, error) {
 	}
 
 	if !ok {
-		return nil, ENOENT
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.retired.Load() {
+			return nil, ENOENT
+		}
+		if item = d.items[leaf]; item != nil {
+			return item, nil
+		}
+		o, err := d._lookupObject(leaf)
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			return nil, ENOENT
+		}
+		if err != nil {
+			return nil, err
+		}
+		file := newFile(d, d.path, o, leaf)
+		file.local = true
+		d.items[leaf] = file
+		return file, nil
 	}
 	return item, nil
 }
@@ -1050,6 +1213,11 @@ func (d *Dir) Create(name string, flags int) (*File, error) {
 	if err := d.checkName(name); err != nil {
 		return nil, err
 	}
+	done, err := d.beginMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	// Return existing node if one exists
 	node, err := d.stat(name)
 	switch err {
@@ -1088,7 +1256,12 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 	if err := d.checkName(name); err != nil {
 		return nil, err
 	}
-	path := path.Join(d.path, name)
+	done, err := d.beginMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	path := path.Join(d.Path(), name)
 	node, err := d.stat(name)
 	switch err {
 	case ENOENT:
@@ -1126,6 +1299,12 @@ func (d *Dir) Remove() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	finish, err := d.beginRemove()
+	if err != nil {
+		return err
+	}
+	removed := false
+	defer func() { finish(removed) }()
 	// Check directory is empty first
 	empty, err := d.isEmpty()
 	if err != nil {
@@ -1137,7 +1316,7 @@ func (d *Dir) Remove() error {
 		return ENOTEMPTY
 	}
 	// remove directory
-	err = d.f.Rmdir(d.vfs.ctx, d.path)
+	err = d.f.Rmdir(d.vfs.ctx, d.Path())
 	if err != nil {
 		fs.Errorf(d, "Dir.Remove failed to remove directory: %v", err)
 		return err
@@ -1152,9 +1331,13 @@ func (d *Dir) Remove() error {
 	}
 	d.mu.Unlock()
 	// Remove the item from the parent directory listing
-	if d.parent != nil {
-		d.parent.delObject(d.Name())
+	d.vfs.dirMu.Lock()
+	parent := d.parent
+	d.vfs.dirMu.Unlock()
+	if parent != nil {
+		parent.delObject(d.Name())
 	}
+	removed = true
 	return nil
 }
 
@@ -1181,6 +1364,8 @@ func (d *Dir) RemoveAll() error {
 
 // DirEntry returns the underlying fs.DirEntry
 func (d *Dir) DirEntry() (entry fs.DirEntry) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.entry
 }
 
@@ -1215,8 +1400,18 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	if err := destDir.checkName(newName); err != nil {
 		return err
 	}
-	oldPath := path.Join(d.path, oldName)
-	newPath := path.Join(destDir.path, newName)
+	done, err := d.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	destDone, err := destDir.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer destDone()
+	oldPath := path.Join(d.Path(), oldName)
+	newPath := path.Join(destDir.Path(), newName)
 	// fs.Debugf(oldPath, "Dir.Rename to %q", newPath)
 	oldNode, err := d.stat(oldName)
 	if err != nil {
@@ -1248,6 +1443,28 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 			return err
 		}
 	case fs.Directory:
+		oldDir := oldNode.(*Dir)
+		oldDone, err := oldDir.beginMutation()
+		if err != nil {
+			return err
+		}
+		defer oldDone()
+		d.vfs.dirMoveMu.Lock()
+		defer d.vfs.dirMoveMu.Unlock()
+		d.vfs.dirMu.Lock()
+		bound := oldDir.key == (dirKey{parent: d.inode, leaf: oldLeaf})
+		descendant := false
+		for parent := destDir; parent != nil; parent = parent.parent {
+			descendant = descendant || parent == oldDir
+		}
+		d.vfs.dirMu.Unlock()
+		if !bound {
+			return ENOENT
+		}
+		if descendant {
+			return EINVAL
+		}
+		x = oldDir.DirEntry().(fs.Directory)
 		features := d.f.Features()
 		if features.DirMove == nil && features.Move == nil && features.Copy == nil {
 			err := fmt.Errorf("Fs %q can't rename directories (no DirMove, Move or Copy)", d.f)
@@ -1277,6 +1494,12 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 
 	// Show moved - delete from old dir and add to new
 	d.delObject(oldLeaf)
+	if file, ok := oldNode.(*File); ok {
+		file.mu.Lock()
+		file.local = true
+		file.generation++
+		file.mu.Unlock()
+	}
 	destDir.addObject(oldNode)
 	if err = d.SetModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Rename failed to set modtime on parent dir: %v", err)
